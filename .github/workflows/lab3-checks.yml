@@ -1,0 +1,184 @@
+name: Lab3 checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lab3-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-report:
+    name: Check report PDF
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Find report PDF in repository root
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob nocaseglob
+
+          reports=()
+          for path in *.pdf; do
+            if [[ -f "$path" ]]; then
+              reports+=("$path")
+            fi
+          done
+
+          if (( ${#reports[@]} == 0 )); then
+            echo "::error::No PDF report found in the repository root. The lab report must be a .pdf file at the repository root."
+            exit 1
+          fi
+
+          echo "Found report PDF(s):"
+          printf '  %s\n' "${reports[@]}"
+
+  test-payloads:
+    name: Test every exploit payload
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify attack/ files are unmodified
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! sha256sum --check --strict - <<'EOF'
+          a9c3d4a5eed6a937e85884f6a53faa39613d49e04792e2c411620fcc74f79097  attack/dark-calc
+          86c2c8dfaf4a89eb7a1396d9731bfb7ee085f0b45c86687b41547a30b5b1c613  attack/dark-calc-nx
+          9a4479f2a522d377055b54d328d5c0e0f3ca1327708ac792028ec03cadaee31d  attack/dark-log
+          03289add49f13e8573d125c8949bd88c9892e84f205802613a6baa2318fb18bc  attack/malware
+          EOF
+          then
+            echo "::error::attack/ files do not match the recorded checksums (see the OK/FAILED lines above). The files under attack/ are lab assets and must not be modified."
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Prepare target binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in dark-calc dark-calc-nx dark-log malware; do
+            if [[ ! -f "attack/$name" ]]; then
+              echo "::error file=attack/$name::Missing file under attack/"
+              exit 1
+            fi
+            chmod +x "attack/$name"
+          done
+          file attack/dark-calc attack/dark-calc-nx attack/dark-log
+
+      - name: Test each payload
+        shell: bash
+        run: |
+          set +e
+          set -u
+          set -o pipefail
+          ulimit -c 0
+
+          if [[ ! -d attack ]]; then
+            echo "::error::The attack/ directory is missing"
+            exit 1
+          fi
+
+          if ! workdir="$(mktemp -d)"; then
+            echo "::error::Could not create a temporary directory"
+            exit 1
+          fi
+          trap 'rm -rf "$workdir"' EXIT
+
+          # payload script | target binary | required output
+          cases=(
+            "payload.py|dark-calc|You have successfully detonated the bomb! Congratulations!"
+            "payload_dark.py|dark-calc|Hope A will be your grade!"
+            "payload_rop.py|dark-calc-nx|Hope A will be your grade!"
+            "payload_canary.py|dark-log|Hope A will be your grade!"
+          )
+
+          tested=()
+          failed=()
+
+          for case in "${cases[@]}"; do
+            IFS='|' read -r payload target expected <<< "$case"
+            tested+=("$payload")
+            echo "::group::Test $payload -> attack/$target"
+
+            if [[ ! -f "$payload" ]]; then
+              echo "::error file=$payload::Payload script is missing (expected at the repository root)"
+              failed+=("$payload")
+              echo "::endgroup::"
+              continue
+            fi
+
+            gen_status=0
+            timeout 15s python3 "$payload" > "$workdir/payload.bin" 2> "$workdir/generate.err" || gen_status=$?
+            if (( gen_status != 0 )); then
+              if (( gen_status == 124 )); then
+                echo "::error file=$payload::Generating the payload timed out after 15s"
+              else
+                echo "::error file=$payload::Generating the payload failed (exit status $gen_status)"
+              fi
+              echo "--- generator stderr ---"
+              cat "$workdir/generate.err"
+              failed+=("$payload")
+              echo "::endgroup::"
+              continue
+            fi
+
+            if [[ ! -s "$workdir/payload.bin" ]]; then
+              echo "::error file=$payload::Generated payload is empty; write the payload bytes to stdout"
+              failed+=("$payload")
+              echo "::endgroup::"
+              continue
+            fi
+
+            if [[ ! -f "attack/$target" || ! -x "attack/$target" ]]; then
+              echo "::error file=attack/$target::Target binary is missing or not executable"
+              failed+=("$payload")
+              echo "::endgroup::"
+              continue
+            fi
+
+            status=0
+            ( cd attack && timeout 15s "./$target" < "$workdir/payload.bin" > "$workdir/stdout.txt" 2> "$workdir/stderr.txt" ) || status=$?
+
+            echo "--- target stdout ---"
+            cat -v "$workdir/stdout.txt"
+            if [[ -s "$workdir/stderr.txt" ]]; then
+              echo "--- target stderr ---"
+              cat -v "$workdir/stderr.txt"
+            fi
+
+            echo "--- target exit status: $status ---"
+            if ! grep -Fq -- "$expected" "$workdir/stdout.txt"; then
+              echo "::error file=$payload::Expected output not found: '$expected' (target: attack/$target, exit status: $status)"
+              failed+=("$payload")
+            else
+              echo "PASS: $payload -> attack/$target"
+            fi
+
+            echo "::endgroup::"
+          done
+
+          if (( ${#failed[@]} != 0 )); then
+            echo "::error::${#failed[@]} payload test(s) failed: ${failed[*]}"
+            exit 1
+          fi
+          echo "All ${#tested[@]} payloads passed."
